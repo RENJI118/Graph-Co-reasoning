@@ -102,9 +102,9 @@ class Attention_block(nn.Module):
                 
 
         # 执行 Canny 边缘检测
-        g_edges_np = cv2.Canny((g_gray_np * 255).astype('uint8'), 100, 200) / 255.0
+        g_contours_np = cv2.Canny((g_gray_np * 255).astype('uint8'), 100, 200) / 255.0
   
-        x_edges_np = cv2.Canny((x_gray_np * 255).astype('uint8'), 100, 200) / 255.0
+        x_contours_np = cv2.Canny((x_gray_np * 255).astype('uint8'), 100, 200) / 255.0
     
             
         g1 = self.W_g(g)
@@ -113,18 +113,18 @@ class Attention_block(nn.Module):
 
       
         # 将边缘检测结果转换回 PyTorch 张量
-        g_edges = torch.from_numpy(g_edges_np).unsqueeze(0).unsqueeze(0).float().to(g.device)
-        # g_edges = g_edges.expand(g1.size(-1), -1, -1, -1).permute(1, 0, 2, 3)
-        g_edges = torch.from_numpy(g_edges_np).unsqueeze(1).unsqueeze(3).float().to(g.device)
-        # x_edges = torch.from_numpy(x_edges_np).unsqueeze(0).unsqueeze(0).float().to(x.device)
-        x_edges = torch.from_numpy(x_edges_np).unsqueeze(1).unsqueeze(3).float().to(x.device)
+        g_contours = torch.from_numpy(g_contours_np).unsqueeze(0).unsqueeze(0).float().to(g.device)
+        # g_contours = g_contours.expand(g1.size(-1), -1, -1, -1).permute(1, 0, 2, 3)
+        g_contours = torch.from_numpy(g_contours_np).unsqueeze(1).unsqueeze(3).float().to(g.device)
+        # x_contours = torch.from_numpy(x_contours_np).unsqueeze(0).unsqueeze(0).float().to(x.device)
+        x_contours = torch.from_numpy(x_contours_np).unsqueeze(1).unsqueeze(3).float().to(x.device)
 
 
 
 
         # 将Canny边缘检测结果与输入特征图相乘
-        g1 = g1 * (1 - g_edges)
-        x1 = x1 * (1 - x_edges)
+        g1 = g1 * (1 - g_contours)
+        x1 = x1 * (1 - x_contours)
 
 
         
@@ -153,7 +153,43 @@ class UpSamplingBlock(nn.Module):
         x=self.conv2(x_concat)
         return x
 
+class EnhanceModule(nn.Module):  #Feature Enhancement
+    def __init__(self, num_in, plane_mid, mids, abn=nn.BatchNorm2d, normalize=False):
+        super(EnhanceModule, self).__init__()
+        
+        
+        self.normalize = normalize
+        self.num_s = int(plane_mid)
+        self.num_n = mids
+        self.priors = nn.AdaptiveAvgPool2d(output_size=(mids + 2, mids + 2))
 
+        self.conv_state = nn.Conv2d(num_in, self.num_s, kernel_size=1)
+        self.conv_proj = nn.Conv2d(num_in, self.num_s, kernel_size=1)
+        self.conv_extend = nn.Conv2d(self.num_s, num_in, kernel_size=1, bias=False)
+
+        self.blocker = abn(num_in)
+
+    def forward(self, x, contour):
+        # contour = F.upsample(contour, (x.size()[-2], x.size()[-1]))
+        contour = nn.functional.interpolate(contour, (x.size()[-2], x.size()[-1]))
+        n, c, h, w = x.size()
+        contour = torch.nn.functional.softmax(contour, dim=1)[:, 1, :, :].unsqueeze(1)
+
+        
+        # Construct projection matrix
+        x_state_reshaped = self.conv_state(x).view(n, self.num_s, -1)       
+        x_proj = self.conv_proj(x)
+  
+
+        x_mask = x_proj * contour
+        x_anchor = self.priors(x_mask)[:, :, 1:-1, 1:-1].reshape(n, self.num_s, -1)
+  
+
+        x_proj_reshaped = torch.matmul(x_anchor.permute(0, 2, 1), x_proj.reshape(n, self.num_s, -1))
+        x_proj_reshaped = torch.nn.functional.softmax(x_proj_reshaped, dim=1)
+     
+
+        return x_proj_reshaped
     
 
 class CrossModalityBranchAttention(nn.Module):
@@ -407,18 +443,18 @@ class MutualModule0(nn.Module):
         self.gcn = CascadeGCNet(dim, loop=2)
         self.conv = nn.Sequential(BasicConv2d(dim, dim, BatchNorm, kernel_size=1, padding=0))
 
-    # graph0: edge, graph1/2: region, assign:edge
-    def forward(self, edge_graph, region_graph1, region_graph2, assign):
-        m = self.corr_matrix(edge_graph, region_graph1, region_graph2)
-        edge_graph = edge_graph + m
+    # graph0: contour, graph1/2: region, assign:contour
+    def forward(self, contour_graph, region_graph1, region_graph2, assign):
+        m = self.corr_matrix(contour_graph, region_graph1, region_graph2)
+        contour_graph = contour_graph + m
 
-        edge_graph = self.gcn(edge_graph)
-        edge_x = edge_graph.bmm(assign)  # reprojection
-        edge_x = self.conv(edge_x.unsqueeze(3)).squeeze(3)
-        return edge_x
+        contour_graph = self.gcn(contour_graph)
+        contour_x = contour_graph.bmm(assign)  # reprojection
+        contour_x = self.conv(contour_x.unsqueeze(3)).squeeze(3)
+        return contour_x
 
-    def corr_matrix(self, edge, region1, region2):
-        assign = edge.permute(0, 2, 1).contiguous().bmm(region1)
+    def corr_matrix(self, contour, region1, region2):
+        assign = contour.permute(0, 2, 1).contiguous().bmm(region1)
         assign = F.softmax(assign, dim=-1)  # normalize region-node
         m = assign.bmm(region2.permute(0, 2, 1).contiguous())
         m = m.permute(0, 2, 1).contiguous()
@@ -433,7 +469,7 @@ class MutualModule1(nn.Module):
 
         self.gcn = CascadeGCNet(dim, loop=3)
 
-        self.pred0 = nn.Conv2d(self.dim, 3, kernel_size=1)  # predicted edge is used for edge-region mutual sub-module
+        self.pred0 = nn.Conv2d(self.dim, 3, kernel_size=1)  # predicted contour is used for contour-region mutual sub-module
 
         self.pred1_ = nn.Conv2d(self.dim, 3, kernel_size=1)  # region prediction
 
@@ -443,10 +479,10 @@ class MutualModule1(nn.Module):
 
         # self.ecg = ECGraphNet(self.dim, BatchNorm, dropout)
 
-    def forward(self, region_x, region_graph, assign, edge_x):
-        b, c, h, w = edge_x.shape
+    def forward(self, region_x, region_graph, assign, contour_x):
+        b, c, h, w = contour_x.shape
 
-        edge = self.pred0(edge_x)
+        contour = self.pred0(contour_x)
 
         region_graph = self.gcn(region_graph)
         n_region_x = region_graph.bmm(assign)
@@ -454,13 +490,13 @@ class MutualModule1(nn.Module):
 
         region_x = region_x + n_region_x  # raw-feature with residual
 
-        region_x = region_x + edge_x
+        region_x = region_x + contour_x
         region_x = self.conv1(region_x)
 
 
         region = self.pred1_(region_x)
 
-        return  edge, region
+        return  contour, region
     
 
 
@@ -470,50 +506,181 @@ class MutualNet(nn.Module):
 
         self.dim = dim
 
-        self.edge_proj0 = GraphNet(node_num=num_clusters, dim=self.dim, normalize_input=False)
+        self.contour_proj0 = GraphNet(node_num=num_clusters, dim=self.dim, normalize_input=False)
         self.region_proj0 = GraphNet(node_num=num_clusters, dim=self.dim, normalize_input=False)
 
-        self.edge_conv = nn.Sequential(BasicConv2d(self.dim, self.dim, BatchNorm, kernel_size=1, padding=0))
-        # BasicConv2d(self.dim, self.dim, BatchNorm, kernel_size=3, padding=1)
-        self.edge_conv[0].reset_params()
+        self.contour_conv = nn.Sequential(BasicConv2d(self.dim, self.dim, BatchNorm, kernel_size=1, padding=0))
+        self.contour_conv[0].reset_params()
 
         self.region_conv1 = nn.Sequential(BasicConv2d(self.dim, self.dim, BatchNorm, kernel_size=1, padding=0))
         self.region_conv1[0].reset_params()
 
         self.region_conv2 = nn.Sequential(BasicConv2d(self.dim, self.dim, BatchNorm, kernel_size=1, padding=0))
         self.region_conv2[0].reset_params()
+        
+        self.gcn = GraphConvNet(dim, dim)
+        
+        self.r2e = EnhanceModule(64, 64, 8, BatchNorm)
 
-        self.r2e = MutualModule0(self.dim, BatchNorm, dropout)
-        # self.e2rr = MutualModule0(self.dim, BatchNorm, dropout)
         self.e2r = MutualModule1(self.dim, BatchNorm, dropout)
+        
+        self.mdf = ModifiedMutualModule(self.dim,num_heads = 1)
 
-    def forward(self, edge_x, region_x):
-        # project region/edge fature to graph
+    def forward(self, contour_x, region_x):
+
         region_graph, region_assign = self.region_proj0(region_x)
-        edge_graph, edge_assign = self.edge_proj0(edge_x)
+        contour_graph, contour_assign = self.contour_proj0(contour_x)
 
-        edge_graph = self.edge_conv(edge_graph.unsqueeze(3)).squeeze(3)
+        contour_graph = self.contour_conv(contour_graph.unsqueeze(3)).squeeze(3)
 
-        # region-edge mutual learning
-        region_graph1 = self.region_conv1(region_graph.unsqueeze(3)).squeeze(3)
-        region_graph2 = self.region_conv2(region_graph.unsqueeze(3)).squeeze(3)
         
-        edge_graph1 = self.edge_conv(edge_graph.unsqueeze(3)).squeeze(3)
-        edge_graph2 = self.edge_conv(edge_graph.unsqueeze(3)).squeeze(3)
-
-        # CGI
+        region_graph_T = region_graph.permute(0, 2, 1)  # (B, D, N)
+        E = region_graph_T.bmm(contour_graph)         # (B, N, M)
         
-        n_region_x = self.r2e(region_graph, edge_graph1, edge_graph2, region_assign)
+        region_graph = self.gcn(region_graph,E)
+        contour_graph = self.gcn(contour_graph,E)
+        
+        n_region_x = self.r2e(region_x, contour_x)
         region_x = region_x + n_region_x.view(region_x.size()).contiguous()
         
-        n_edge_x = self.r2e(edge_graph, region_graph1, region_graph2, edge_assign)
-        edge_x = edge_x + n_edge_x.view(edge_x.size()).contiguous()
+        n_contour_x = self.r2e(contour_x,region_x)
+        contour_x = contour_x + n_contour_x.view(contour_x.size()).contiguous()
 
-        # edge-region mutual learning
-        edge, region = self.e2r(region_x, region_graph, region_assign, edge_x)
+   
+        region = self.mdf(region_graph, contour_graph, region_assign, contour_assign,region_x,contour_x)
 
-        return  edge, region
+        return   region
 
+class GATLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, num_heads, dropout=0.1):
+        super(GATLayer, self).__init__()
+        self.num_heads = num_heads
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.attn_layers = nn.ModuleList([
+            nn.Linear(self.in_dim, self.out_dim ) 
+        ])
+        self.dropout = nn.Dropout(dropout)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.output_proj = nn.Linear(out_dim, out_dim)  # 合并多头注意力
+
+    def forward(self, x, adj):
+        # 假设输入 x 的形状为 [batch, nodes, in_dim]，adj 的形状为 [batch, nodes, nodes]
+        x = x.permute(0, 2, 1)  # 转置后形状为 [batch, nodes, in_dim]
+        batch_size, num_nodes, in_dim = x.shape
+        attn_heads = []
+        for attn_layer in self.attn_layers:
+            x_flat = x.reshape(-1, self.in_dim)
+            q = k = attn_layer(x_flat)  # 形状：[batch, nodes, out_dim // num_heads]
+            q = q.view(batch_size, num_nodes, -1)  # 恢复形状 [batch, nodes, out_dim // num_heads]
+            k = k.view(batch_size, num_nodes, -1)
+            scores = torch.bmm(q, k.transpose(1, 2))  # 点积注意力：[batch, nodes, nodes]
+            scores = scores / torch.sqrt(torch.tensor(scores.size(-1), dtype=torch.float32))
+            scores = F.softmax(scores, dim=-1)
+            attn_heads.append(torch.bmm(scores, q))  # 形状：[batch, nodes, out_dim // num_heads]
+
+
+        # 拼接多头输出并投影
+        x = torch.cat(attn_heads, dim=-1)  # 形状：[batch, nodes, out_dim]
+ 
+        x = self.output_proj(x)
+        # 转置回 [batch, out_dim, nodes]
+        return x.permute(0, 2, 1)
+    
+    
+class ModifiedMutualModule(nn.Module):
+    def __init__(self, dim, BatchNorm=nn.BatchNorm2d,num_heads=4, dropout=0.1):
+        super(ModifiedMutualModule, self).__init__()
+        self.dim = dim
+        
+        self.gat = GATLayer(dim, dim, num_heads=num_heads, dropout=dropout)
+        self.conv = nn.Sequential(nn.Conv2d(dim, dim, kernel_size=1, padding=0), nn.BatchNorm2d(dim), nn.ReLU())
+        self.conv0 = nn.Sequential(BasicConv2d(self.dim, self.dim, BatchNorm, kernel_size=1, padding=0))
+        self.conv1 = nn.Sequential(BasicConv2d(self.dim, self.dim, BatchNorm, kernel_size=1, padding=0))
+        self.pred = nn.Conv2d(self.dim, 3, kernel_size=1)
+        self.gcn = CascadeGCNet(dim, loop=3)
+
+    def compute_similarity(self, contour_graph, region_graph):
+        # 余弦相似性计算
+        contour_graph = contour_graph.permute(0, 2, 1)  # 转换为 [batch, nodes, in_dim]
+        region_graph = region_graph.permute(0, 2, 1)
+        contour_norm = F.normalize(contour_graph, dim=-1)
+        region_norm = F.normalize(region_graph, dim=-1)
+        similarity = torch.bmm(contour_norm, region_norm.transpose(1, 2))
+        return similarity
+
+ 
+    def generate_adjacency(self, similarity, threshold=0.8):
+        # 基于相似性添加跨图边
+        adj = (similarity > threshold).float()
+        adj = (adj + adj.transpose(1, 2)) / 2  # 确保对称性
+        
+        return adj   
+    def generate_unified_adjacency(self, adj, cross_similarity, threshold=0.8):
+        # adj: [B, N, N], 原始图的邻接矩阵
+        # cross_similarity: [B, N, N], 跨图节点相似性矩阵
+
+        # 创建 zero 矩阵存放 unified_adj
+        B, N, _ = adj.shape
+        unified_adj = torch.zeros(B, 2 * N, 2 * N, device=adj.device)
+
+        # 填充邻接矩阵
+        unified_adj[:, :N, :N] = adj  # contour_graph 的自关系
+        unified_adj[:, N:, N:] = adj  # region_graph 的自关系
+
+        # 计算跨图关系
+        cross_adj = (cross_similarity > threshold).float()
+
+        # 填充跨图的关系
+        unified_adj[:, :N, N:] = cross_adj
+        unified_adj[:, N:, :N] = cross_adj.transpose(1, 2)
+
+        # 确保对称性
+        unified_adj = (unified_adj + unified_adj.transpose(1, 2)) / 2
+        return unified_adj
+        
+    
+    def forward(self, region_graph, contour_graph, region_assign, contour_assign,region_x, contour_x):
+
+        # 计算相似性矩阵
+        similarity = self.compute_similarity(contour_graph, region_graph)
+        adj = self.generate_adjacency(similarity)
+
+      # 使用GCN计算聚合特征
+        # region_graph = self.gcn(region_graph)
+        # contour_graph = self.gcn(contour_graph)
+        
+        # 使用GAT计算聚合特征
+        contour_graph = self.gat(contour_graph, adj)  # GAT邻接矩阵，用动态构造方式生成
+        region_graph = self.gat(region_graph, adj)
+        
+
+        # 更新图
+        unified_graph = torch.cat([contour_graph, region_graph], dim=-1)
+        unified_adj = self.generate_unified_adjacency(adj, similarity)
+        unified_graph = self.gat(unified_graph, unified_adj)
+ 
+
+        
+        region_part = unified_graph[:, :, 8:]
+        weights = torch.softmax(torch.cat((contour_assign, region_assign), dim=1), dim=1)
+        contour_weight = weights[:, :8, :]  # 对应 contour 的权重
+        region_weight = weights[:, 8:, :]  # 对应 region 的权重
+        fused_assign = contour_weight * contour_assign + region_weight * region_assign
+        # 特征回投    
+        n_region_x = region_part.bmm(fused_assign)
+        n_region_x = self.conv0(n_region_x.view(region_x.size()))
+        
+        region_x = region_x + n_region_x  # raw-feature with residual
+        region_x = region_x + contour_x
+        region_x = self.conv1(region_x)
+     
+
+
+        region = self.pred(region_x)
+
+        
+        return region
 
 
 
@@ -664,11 +831,11 @@ class model(nn.Module):
         out_trans=self._reshape_output(out_trans)
 
 
-        edge, region=self.MutualNet(up1, out_trans)
+        region=self.MutualNet(up1, out_trans)
 
 
 
-        return   edge, region,out_contour,out_region
+        return   region,out_contour,out_region
 
 
 
