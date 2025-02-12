@@ -122,8 +122,8 @@ def train(args, train_loader, model, optimizer, epoch, scheduler=None):
         input, target = input.to(device), target.to(device)
         
 
-        contour, region, out_region,out_contour = model(input)
-        # out_region,out_contour = model(input)
+        region, out_region,out_contour = model(input)
+
 
         # compute output
         criterion=BCEDiceLoss()
